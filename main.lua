@@ -9,7 +9,7 @@ local L:any=RS:WaitForChild("Library",15)
 assert(L,"PS99 Library unavailable")
 local loadModule:any=require
 local Http=game:GetService("HttpService")
-local M:any={Alive=true,Version="1.7-boss-threshold-test",Started=os.clock(),Connections={},Owned={},Errors={},
+local M:any={Alive=true,Version="1.8-auto-flame-test",Started=os.clock(),Connections={},Owned={},Errors={},
     AutoBreak=false,AutoDrops=false,AntiAFK=false,DropBusy=false,DropDelay=.6,DropBatch=3,
     LuckyDelay=.8,OrbWait=6,OrbScope="Лучшая зона",OrbMovement="Телепорт",BreakScope="Все открытые",
     BreakStatus="Выключено",DropStatus="Выключен",AFKStatus="Выключен",Assigned=0,RemovedDrops=0,
@@ -484,8 +484,11 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
         local requested=recommended*math.clamp(E.BossLuckPercent or 100,50,200)/100
         return coins,math.min(requested,maximum),current,maximum,recommended
     end
+    function E.BossEnabled()
+        return E.AutoBoss or (M.AutoFlame and M.AutoFlame.NeedsBoss)==true
+    end
     function E.BossStep()
-        if not E.AutoBoss then E.BossStatus="Выключен";return end
+        if not E.BossEnabled()then E.BossStatus="Выключен";return end
         if os.clock()<E.NextClick then return end
         E.NextClick=os.clock()+.17
         if not E.Init()or not E.HW.Instance()then E.BossStatus="Войди в Hatch Wars";return end
@@ -526,13 +529,13 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
             E.StartTask=task.spawn(function()
                 -- The start request may yield; keep clicks and the UI worker responsive.
                 local ok,result=pcall(function()
-                    if not M.Alive or not E.AutoBoss or E.HW.Instance()~=inst then return false end
+                    if not M.Alive or not E.BossEnabled()or E.HW.Instance()~=inst then return false end
                     local currentCoins,threshold,available=E.BossThreshold(zone)
                     if E.Currency.Get(E.Types.COIN)<currentCoins or available+1e-6<threshold then return false end
                     r.CFrame=CFrame.new(startPosition+Vector3.new(0,3,6))*r.CFrame.Rotation
                     r.AssemblyLinearVelocity=Vector3.zero
                     task.wait(.6)
-                    if not M.Alive or not E.AutoBoss or E.HW.Instance()~=inst or root()~=r then return false end
+                    if not M.Alive or not E.BossEnabled()or E.HW.Instance()~=inst or root()~=r then return false end
                     -- Recheck immediately before asking the game to start (no underfunded dialog).
                     currentCoins,threshold,available=E.BossThreshold(zone)
                     if E.Currency.Get(E.Types.COIN)<currentCoins or available+1e-6<threshold then return false end
@@ -548,7 +551,7 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
                 end
                 E.BossPending=false;E.StartTask=nil
                 E.BossStartNext=os.clock()+(ok and result and 8 or 4)
-                if M.Alive and E.AutoBoss then
+                if M.Alive and E.BossEnabled()then
                     E.BossStatus=ok and result and "Бой запущен"or ("Старт не подтверждён · повтор через 4 с"..(not ok and (" · "..tostring(result))or ""))
                 end
             end)
@@ -747,7 +750,7 @@ function M.BreakStep()
     end
     if #nearby==0 then
         M.ReleasePets()
-        if not M.FarmAreaTP then M.BreakStatus="Войди в пунктирную зону фарма или включи TP в зону";return end
+        if not M.FarmAreaTP and not (M.AutoFlame and M.AutoFlame.Active)then M.BreakStatus="Войди в пунктирную зону фарма или включи TP в зону";return end
         if os.clock()<M.NextFarmMove then M.BreakStatus="Ожидание входа в зону фарма";return end
         local pos=targets[1]:GetPivot().Position
         r.CFrame=CFrame.new(pos+Vector3.new(0,4,0))*r.CFrame.Rotation;r.AssemblyLinearVelocity=Vector3.zero
@@ -1199,6 +1202,98 @@ function K.Step()
     K.Status="Бустеры → "..count.." яиц · открытие "..(K.Batch+1).."/"..K.BatchLimit
     K.Hatch(egg,count,true)
 end
+-- Optional flame controller: no mandatory tier in the clan hatch state machine.
+local F:any={Enabled=false,Target=3,Active=false,NeedsBoss=false,Status="Выключено"}
+M.AutoFlame=F
+function F.State(inst:any)
+    local state=inst:GetSavedValue(E.Types.SAVE.Flames)
+    if type(state)~="table"then return 0,0 end
+    local remaining=math.max(0,(tonumber(state.EndsAt)or 0)-workspace:GetServerTimeNow())
+    local tier=math.clamp(math.floor(tonumber(state.Tier)or 0),0,3)
+    return remaining>0 and tier or 0,remaining
+end
+function F.Release()
+    F.NeedsBoss=false
+    local prior=F.Prior;F.Prior=nil;F.Active=false
+    if not prior then return end
+    M.ClearLucky();M.ClearHover();M.CancelDrops();M.ReleasePets()
+    E.AutoOrbs=prior.Orbs;M.AutoBreak=prior.Break;M.AutoDrops=prior.Drops
+    M.OrbScope=prior.OrbScope;M.BreakScope=prior.BreakScope
+    if root()==prior.Root and E.HW.Instance()==prior.Instance
+        and not E.HW.Feature("Boss").IsFighting()and not E.HW.Feature("Boss").HudHidden then
+        prior.Root.CFrame=prior.Position;prior.Root.AssemblyLinearVelocity=Vector3.zero
+    end
+end
+function F.SetEnabled(value:boolean)
+    F.Enabled=value
+    if not value then
+        if F.NeedsBoss and not E.AutoBoss then E.CancelStart()end
+        F.Release();F.Status="Выключено"
+    else F.Status="Проверяем пламя"end
+end
+function F.Acquire(inst:any)
+    if F.Active then return end
+    local r=root()
+    F.Prior={Orbs=E.AutoOrbs,Break=M.AutoBreak,Drops=M.AutoDrops,OrbScope=M.OrbScope,
+        BreakScope=M.BreakScope,Root=r,Instance=inst,Position=r.CFrame}
+    F.Active=true;M.ClearLucky();M.ClearHover();M.CancelDrops();M.ReleasePets()
+end
+function F.CoinsStep():boolean
+    if not E.AutoBoss then F.Release();return false end
+    if not E.Init()or not E.HW.Instance()or not root()then F.Release();return false end
+    local inst=E.HW.Instance();local boss=E.HW.Feature("Boss")
+    if boss.IsFighting()or boss.HudHidden or E.BossPending then F.Release();return false end
+    local required=boss.Recommended(E.BestZone())
+    local balance=E.Currency.Get(E.Types.COIN)
+    if balance>=required then F.Release();return false end
+    if M.EntryPending or E.UpgradePending or E.PumpkinPending or K.Pending or (M.AutoEgg and M.AutoEgg.Pending)then return F.Active end
+    if blocked()then F.Status=M.Conflict or "Пауза: бой / персонаж";return F.Active end
+    F.Acquire(inst);F.NeedsBoss=false
+    E.AutoOrbs=false;M.AutoBreak=true;M.AutoDrops=true;M.BreakScope="Лучшая зона"
+    E.BossStatus="Фарм монет для босса: "..tostring(balance).." / "..tostring(required)
+    F.Status=E.BossStatus
+    return true
+end
+function F.Step():boolean
+    if not F.Enabled then return F.CoinsStep()end
+    if not E.Init()or not E.HW.Instance()or not root()then
+        F.Release();F.Status="Войди в Hatch Wars";return false
+    end
+    local inst=E.HW.Instance();local boss=E.HW.Feature("Boss")
+    local tier,remaining=F.State(inst)
+    if F.Active and (boss.IsFighting()or boss.HudHidden or E.BossPending)then
+        F.NeedsBoss=true;E.BossStep();F.Status="Пламя "..tier.." / "..F.Target.." · "..E.BossStatus;return true
+    end
+    if tier>=F.Target then
+        F.Release();F.Status="Пламя "..tier.." / "..F.Target.." · осталось "..math.ceil(remaining).." с";return F.CoinsStep()
+    end
+    if E.BestZone()<#E.Types.ZONES then
+        F.Release();F.Status="Нужна последняя открытая зона; новые зоны не открывает";return false
+    end
+    if E.Flags.Get(E.Flags.Keys.HatchWar_Flames)==false then
+        F.Release();F.Status="Пламя отключено игрой";return false
+    end
+    if M.EntryPending or E.UpgradePending or E.PumpkinPending or K.Pending or (M.AutoEgg and M.AutoEgg.Pending)then
+        F.Status="Ждём завершения текущего действия";return F.Active
+    end
+    if not F.Active then
+        if blocked()then F.Status=M.Conflict or "Пауза: бой / персонаж";return false end
+        F.Acquire(inst)
+    end
+    F.NeedsBoss=true
+    local coins,goal,available=E.BossThreshold(E.BestZone())
+    E.AutoOrbs=false;M.AutoBreak=false;M.AutoDrops=false
+    if E.Currency.Get(E.Types.COIN)<coins then
+        M.AutoBreak=true;M.AutoDrops=true;M.BreakScope="Лучшая зона"
+        F.Status="Пламя "..tier.." / "..F.Target.." · фарм монет для босса"
+    elseif available+1e-6<goal then
+        E.AutoOrbs=true;M.OrbScope="Все открытые";E.OrbStep()
+        F.Status="Пламя "..tier.." / "..F.Target.." · собираем удачу: "..math.floor(available).." / "..math.ceil(goal)
+    else
+        E.BossStep();F.Status="Пламя "..tier.." / "..F.Target.." · "..E.BossStatus
+    end
+    return true
+end
 local N:any={Enabled=false,Pending=false,Next=0,Epoch=0,Batches=0,Pets=0,Status="Выключено"}
 M.AutoEgg=N
 function N.SetEnabled(value:boolean)
@@ -1220,6 +1315,7 @@ function N.Nearest()
 end
 function N.Step()
     if not N.Enabled or N.Pending or os.clock()<N.Next then return end
+    if F.Active then N.Status="Пауза: набираем пламя удачи";return end
     if K.Enabled then N.Status="Открытиями управляет цикл КБ";return end
     if not K.Init()or blocked()or M.EntryPending then N.Status="Пауза: вход / бой / тыква";return end
     local egg=N.Nearest()
@@ -1289,9 +1385,9 @@ C.IDs={"EventMinimize","ClanFill","ClanMultiplier","ClanBoosts","ClanBatch","Cla
     "EventAutoEgg",
     "ClanHideHatch","EventScope","EventMovement","LuckyInterval","PickupTimeout",
     "DropBatch","DropInterval","EventFarmTP","BreakScope","EventAFK","EventProgress",
-    "EventUpgrade","EventBoss","BossLuckPercent","EventBreak","EventDrops","EventLucky","ClanCycle",
+    "EventUpgrade","EventBoss","BossLuckPercent","AutoFlame","FlameTier","EventBreak","EventDrops","EventLucky","ClanCycle",
     "WebhookEnabled","WebhookUrl","WebhookDiscordID","WebhookTypes","ConfigAutoLoad","ConfigAutoSave"}
-C.Active={"EventBoss","EventBreak","EventDrops","EventLucky","EventAutoEgg","ClanCycle"}
+C.Active={"EventBoss","EventBreak","EventDrops","EventLucky","EventAutoEgg","ClanCycle","AutoFlame"}
 function C.Snapshot()
     local values={}
     for _,id in ipairs(C.IDs)do
@@ -1471,6 +1567,7 @@ table.insert(M.Connections,UIS.InputChanged:Connect(function(input)
     if input.UserInputType==Enum.UserInputType.MouseMovement then M.LastInput=os.clock()end
 end))
 function M.Stop()
+    F.SetEnabled(false)
     N.SetEnabled(false)
     M.SetHideEggs(false)
     K.SetEnabled(false)
@@ -1537,7 +1634,7 @@ local built,buildError=pcall(function()
     M.StatsCard=Tabs.Home:AddParagraph({Title="Сессия",Content=""})
     M.ClanCard=Tabs.Clan:AddParagraph({Title="Цикл КБ · тестовая версия",Content="Выключен"})
     local clanToggle:any
-    clanToggle=toggle(Tabs.Clan,"ClanCycle","Цикл клановой битвы","Последний набор питомцев на дереве, лучший выбранный x, банк удачи и бустеры. Босс не запускается.",function(v)
+    clanToggle=toggle(Tabs.Clan,"ClanCycle","Цикл клановой битвы","Последний набор питомцев на дереве, лучший выбранный x, банк удачи и бустеры. Сам не запускает босса; «Авто пламя» включается отдельно.",function(v)
         if not v then K.SetEnabled(false);return end
         if M.Restoring then K.SetEnabled(true);return end
         Window:Dialog({Title="Запустить полный цикл КБ?",Content="Расходует выбранные бустеры и запасных ивентовых питомцев. Сохраняет команду 15: Huge не отдаёт, при 15 Huge оставляет одного лучшего обычного питомца. Заблокированных и эксклюзивных не трогает. Если запаса нет — фармит питомцев. Остальная автоматика остановится.",Buttons={
@@ -1545,6 +1642,10 @@ local built,buildError=pcall(function()
             {Title="Отмена",Callback=function()clanToggle:SetValue(false)end}}})
     end)
     Tabs.Clan:AddSlider("ClanFill",{Title="Банк перед серией, %",Default=80,Min=10,Max=100,Rounding=0,Callback=function(v)K.FillPercent=v end})
+    toggle(Tabs.Clan,"AutoFlame","Авто пламя удачи","Отдельная функция: добирает выбранный тир через босса, затем возвращает управление фарму. После окончания пламени повторяет. Использует порог удачи из вкладки «Бой».",F.SetEnabled)
+    local flameTier=Tabs.Clan:AddDropdown("FlameTier",{Title="Какой тир пламени поддерживать",Values={"I","II","III"},Default=3,Multi=false})
+    flameTier:OnChanged(function(v)F.Target=({I=1,II=2,III=3})[v]or 3 end)
+    M.FlameCard=Tabs.Clan:AddParagraph({Title="Пламя удачи",Content="Выключено"})
     local multiplier=Tabs.Clan:AddDropdown("ClanMultiplier",{Title="Какие x яйца дерева открывать",Values={"1.25","1.5","2","2.5","3"},Default={"2","2.5","3"},Multi=true})
     multiplier:OnChanged(function(v)K.Multipliers=K.Selection(v)end)
     local boosts=Tabs.Clan:AddDropdown("ClanBoosts",{Title="Какие бустеры тратить · несколько галочек",Values={"Свеча I","Свеча II","Фонарь I","Фонарь II"},Default={"Свеча I","Свеча II","Фонарь I","Фонарь II"},Multi=true})
@@ -1580,8 +1681,8 @@ local built,buildError=pcall(function()
     Tabs.Collect:AddSlider("DropBatch",{Title="Обычных орбов за проход",Default=3,Min=1,Max=10,Rounding=0,Callback=function(v)M.DropBatch=v end})
     Tabs.Collect:AddSlider("DropInterval",{Title="Пауза между обычными орбами",Default=.6,Min=.25,Max=2,Rounding=2,Callback=function(v)M.DropDelay=v end})
     Tabs.Collect:AddParagraph({Title="Ховерборд",Content="Включи ховерборд вручную. Этот режим направляет его к наземным орбам, не телепортирует. Отключение возвращает обычное управление. Орбы на лестнице тыквы намеренно пропускаются."})
-    toggle(Tabs.Fight,"EventBoss","Auto Boss","Лучшая зона: рекомендованные монеты + выбранный процент удачи. Недостижимый порог ограничивается полным банком.",function(v)
-        E.AutoBoss=v;E.BossStartNext=0;if not v then E.CancelStart()end
+    toggle(Tabs.Fight,"EventBoss","Auto Boss","Лучшая зона: сам фармит рекомендованные монеты, затем ждёт выбранный процент удачи. Недостижимый порог ограничивается полным банком.",function(v)
+        E.AutoBoss=v;E.BossStartNext=0;if not v and not F.NeedsBoss then E.CancelStart();if not F.Enabled then F.Release()end end
     end)
     Tabs.Fight:AddSlider("BossLuckPercent",{Title="Удача для босса, % от рекомендации",Default=100,Min=50,Max=200,Rounding=0,Callback=function(v)E.BossLuckPercent=v;E.BossStartNext=0 end})
     toggle(Tabs.Fight,"EventProgress","Auto переход в новую зону","После подтверждённого открытия арены. Ждёт окончания камеры босса.",function(v)E.AutoProgress=v end)
@@ -1702,6 +1803,7 @@ elseif saved then
         {Title="Не загружать",Callback=function()C.Ready=false;C.Status="Автосохранение приостановлено; сохранённый файл не изменён"end}}})
 else C.Ready=true;C.Status="Автосохранение готово"end
 table.insert(M.Connections,LP.CharacterAdded:Connect(function()
+    F.Release()
     K.Cancel();if K.Enabled then K.SetPhase("Bank")end
     M.ClearLucky();M.ReleasePets();M.ClearHover();M.CancelDrops();E.CancelStart();E.CancelPumpkin();E.CancelUpgrade()
     E.NextOrb=os.clock()+3;E.BossStartNext=os.clock()+3;M.NextBreak=os.clock()+3
@@ -1715,8 +1817,11 @@ M.Worker=task.spawn(function()
             C.Step();W.Step()
             if M.AutoEnter and not M.EntryPending and os.clock()>=M.EntryNext then M.EnterEvent()end
             if M.Conflict then M.SetDesc(E.Card,M.Conflict)end
-            if not M.Conflict and E.Init()then E.UpgradeStep()end
-            if K.Enabled then K.Step()
+            local flameBusy=F.Step()
+            if not flameBusy and not M.Conflict and E.Init()then E.UpgradeStep()end
+            if flameBusy then
+                -- Optional controller owns movement only until the requested flame is active.
+            elseif K.Enabled then K.Step()
             elseif not N.Pending then
                 if not blocked()then E.ProgressStep();E.PumpkinStep()end
                 E.OrbStep()
@@ -1737,6 +1842,7 @@ M.Worker=task.spawn(function()
                 M.SetDesc(M.ConfigCard,C.Status or "Настройки не сохранены")
                 M.SetDesc(M.WebhookCard,W.Status)
                 M.SetDesc(M.EggCard,N.Status)
+                M.SetDesc(M.FlameCard,F.Status)
                 M.SetDesc(M.ClanCard,K.Status.."\n"..(K.EggStatus or "").."\n"..(K.InventoryStatus or "").."\nПринято открытий: "..K.Hatches.." · свечей: "..K.Candles.." · фонарей: "..K.Lanterns.."\nУдача: все открытые зоны, без дерева")
             end
         end,function(message)return debug.traceback(tostring(message))end)
