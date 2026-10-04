@@ -9,7 +9,7 @@ local L:any=RS:WaitForChild("Library",15)
 assert(L,"PS99 Library unavailable")
 local loadModule:any=require
 local Http=game:GetService("HttpService")
-local M:any={Alive=true,Version="1.6-upgrade-trip-test",Started=os.clock(),Connections={},Owned={},Errors={},
+local M:any={Alive=true,Version="1.7-boss-threshold-test",Started=os.clock(),Connections={},Owned={},Errors={},
     AutoBreak=false,AutoDrops=false,AntiAFK=false,DropBusy=false,DropDelay=.6,DropBatch=3,
     LuckyDelay=.8,OrbWait=6,OrbScope="Лучшая зона",OrbMovement="Телепорт",BreakScope="Все открытые",
     BreakStatus="Выключено",DropStatus="Выключен",AFKStatus="Выключен",Assigned=0,RemovedDrops=0,
@@ -35,7 +35,7 @@ end
 local createEvent=(function()
 -- Verified against Hatch Wars client modules; no remote-name guesses.
 return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
-    local E:any={AutoOrbs=false,AutoBoss=false,BossPending=false,BossStartNext=0,WasFighting=false,OrbStatus="Выключен",BossStatus="Выключен",
+    local E:any={AutoOrbs=false,AutoBoss=false,BossLuckPercent=100,BossPending=false,BossStartNext=0,WasFighting=false,OrbStatus="Выключен",BossStatus="Выключен",
         AutoProgress=true,AutoUpgrades=false,UpgradePending=false,NextUpgrade=0,UpgradeStatus="Выключено",Priorities={},PriorityLoading=true,
         AutoPumpkin=false,PumpkinPending=false,NextPumpkin=0,PumpkinStatus="Выключена",PumpkinFed=0,PumpkinOpened=0,
         NextOrb=0,NextClick=0,NextStatus=0,Skipped=setmetatable({},{__mode="k"}),Teleports=0,Clicks=0,CircleHits=0}
@@ -51,7 +51,8 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
             if not module then error("Hatch Wars отсутствует в этой локации",0)end
             local data={HW=loadModule(module),Types=loadModule(L.Types.HatchWar),
                 Input=loadModule(module.Boss.Input),GUI=loadModule(L.Client.GUI),
-                Currency=loadModule(L.Client.CurrencyCmds),UpgradeCmds=loadModule(L.Client.EventUpgradeCmds)}
+                Currency=loadModule(L.Client.CurrencyCmds),UpgradeCmds=loadModule(L.Client.EventUpgradeCmds),
+                Luck=loadModule(L.Util.HatchWarLuck),Flags=loadModule(L.Universal.FFlags),Actor=loadModule(module.Boss.Actor)}
             if type(data.HW)~="table"or type(data.HW.Feature)~="function"or type(data.HW.Instance)~="function"
                 or type(data.Types)~="table"or type(data.Types.UPGRADES)~="table"or type(data.Types.ZONES)~="table"
                 or type(data.Input)~="table"or type(data.Input.PressCentre)~="function"
@@ -469,6 +470,20 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
         E.OrbStatus="Сбор · зона "..zone.." · банк "..bank.."/"..cap
         -- The game's proximity collector performs the claim after character replication.
     end
+    function E.BossThreshold(zone:number)
+        local boss=E.HW.Feature("Boss")
+        local coins,recommended=boss.Recommended(zone)
+        local current=boss.PlayerLuck(zone)
+        local bank,cap=E.HW.Feature("Orbs").Bank()
+        local computed=E.Luck.Compute(LP,{inFight=true,eggId=E.Types.ZONES[zone].Egg,zone=zone})
+        local perOrb=E.Flags.GetNumber(E.Flags.Keys.HatchWar_OrbLuckPerOrb)
+            *(1+E.UpgradeCmds.GetPower(E.Types.UPGRADES.OrbPower)/100)
+        -- Same additive orb contribution and FightMult as the game's FightLuck.
+        -- Only fill the existing bank; never wait for unavailable future boosts/upgrades.
+        local maximum=current+math.max(0,cap-bank)*perOrb*math.max(1,computed.FightMult or 1)
+        local requested=recommended*math.clamp(E.BossLuckPercent or 100,50,200)/100
+        return coins,math.min(requested,maximum),current,maximum,recommended
+    end
     function E.BossStep()
         if not E.AutoBoss then E.BossStatus="Выключен";return end
         if os.clock()<E.NextClick then return end
@@ -480,15 +495,16 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
             if E.WasFighting then E.WasFighting=false;E.BossStartNext=os.clock()+8 end
             if E.BossPending then E.BossStatus="Ожидание старта боя…";return end
             if os.clock()<E.BossStartNext then return end
+            if M.EntryPending or M.DropBusy or (M.AutoEgg and M.AutoEgg.Pending)then E.BossStatus="Пауза: вход / подбор / открытие";return end
             E.BossStartNext=os.clock()+2
             local inst=E.HW.Instance();local zone=E.BestZone()
-            local required,luck=boss.Recommended(zone)
+            local required,luck,currentLuck,maximum,recommended=E.BossThreshold(zone)
             local balance=E.Currency.Get(E.Types.COIN)
             if balance<required then
                 E.BossStatus="Ожидание монет: "..tostring(balance).."/"..tostring(required);return
             end
-            if boss.PlayerLuck(zone)<luck then
-                E.BossStatus="Ожидание удачи: "..math.floor(boss.PlayerLuck(zone)).."/"..tostring(luck);return
+            if currentLuck+1e-6<luck then
+                E.BossStatus=string.format("Копим удачу: %.0f / %.0f · порог %.0f%% · доступно до %.1f%%",currentLuck,luck,E.BossLuckPercent,maximum/math.max(1,recommended)*100);return
             end
             if M.Farm or M.AutoRank then E.BossStatus="Выключи Auto Farm / Auto Rank";return end
             local character=LP.Character;local r=character and character:FindFirstChild("HumanoidRootPart")
@@ -498,25 +514,42 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
             local bosses=interact and interact:FindFirstChild("Bosses")
             local target=bosses and bosses:FindFirstChild("Boss"..zone)
             if not target or not target:IsA("Model")then E.BossStatus="Ожидание модели босса";return end
+            local spot=E.Actor.Root(zone)
+            if not spot then spot=E.Actor.Spots(target)end
+            if not spot then spot=target:FindFirstChild("Player")end
+            if not spot or not spot:IsA("BasePart")then E.BossStatus="Ожидание точки входа босса";return end
+            local startPosition=spot.Position
+            local returnPosition=r.CFrame
             E.BossPending=true;E.BossStatus="Запуск босса · зона "..zone
+            if M.ClearLucky then M.ClearLucky()end
+            if M.ClearHover then M.ClearHover()end
             E.StartTask=task.spawn(function()
                 -- The start request may yield; keep clicks and the UI worker responsive.
                 local ok,result=pcall(function()
                     if not M.Alive or not E.AutoBoss or E.HW.Instance()~=inst then return false end
-                    local currentCoins,currentLuck=boss.Recommended(zone)
-                    if E.Currency.Get(E.Types.COIN)<currentCoins or boss.PlayerLuck(zone)<currentLuck then return false end
-                    r.CFrame=target:GetPivot()*CFrame.new(0,3,6)
+                    local currentCoins,threshold,available=E.BossThreshold(zone)
+                    if E.Currency.Get(E.Types.COIN)<currentCoins or available+1e-6<threshold then return false end
+                    r.CFrame=CFrame.new(startPosition+Vector3.new(0,3,6))*r.CFrame.Rotation
                     r.AssemblyLinearVelocity=Vector3.zero
                     task.wait(.6)
-                    if not M.Alive or not E.AutoBoss or E.HW.Instance()~=inst then return false end
+                    if not M.Alive or not E.AutoBoss or E.HW.Instance()~=inst or root()~=r then return false end
                     -- Recheck immediately before asking the game to start (no underfunded dialog).
-                    if E.Currency.Get(E.Types.COIN)<currentCoins or boss.PlayerLuck(zone)<currentLuck then return false end
-                    return boss.RequestFight(zone)
+                    currentCoins,threshold,available=E.BossThreshold(zone)
+                    if E.Currency.Get(E.Types.COIN)<currentCoins or available+1e-6<threshold then return false end
+                    local accepted=boss.RequestFight(zone)
+                    if accepted then
+                        local deadline=os.clock()+3
+                        while M.Alive and E.HW.Instance()==inst and not boss.IsFighting()and not boss.HudHidden and os.clock()<deadline do task.wait(.1)end
+                    end
+                    return accepted and (boss.IsFighting()or boss.HudHidden)
                 end)
+                if not boss.IsFighting()and not boss.HudHidden and root()==r and E.HW.Instance()==inst then
+                    r.CFrame=returnPosition;r.AssemblyLinearVelocity=Vector3.zero
+                end
                 E.BossPending=false;E.StartTask=nil
-                E.BossStartNext=os.clock()+(ok and result and 8 or 20)
+                E.BossStartNext=os.clock()+(ok and result and 8 or 4)
                 if M.Alive and E.AutoBoss then
-                    E.BossStatus=ok and result and "Бой запущен"or "Старт отклонён · повтор через 20 с"
+                    E.BossStatus=ok and result and "Бой запущен"or ("Старт не подтверждён · повтор через 4 с"..(not ok and (" · "..tostring(result))or ""))
                 end
             end)
             return
@@ -1256,7 +1289,7 @@ C.IDs={"EventMinimize","ClanFill","ClanMultiplier","ClanBoosts","ClanBatch","Cla
     "EventAutoEgg",
     "ClanHideHatch","EventScope","EventMovement","LuckyInterval","PickupTimeout",
     "DropBatch","DropInterval","EventFarmTP","BreakScope","EventAFK","EventProgress",
-    "EventUpgrade","EventBoss","EventBreak","EventDrops","EventLucky","ClanCycle",
+    "EventUpgrade","EventBoss","BossLuckPercent","EventBreak","EventDrops","EventLucky","ClanCycle",
     "WebhookEnabled","WebhookUrl","WebhookDiscordID","WebhookTypes","ConfigAutoLoad","ConfigAutoSave"}
 C.Active={"EventBoss","EventBreak","EventDrops","EventLucky","EventAutoEgg","ClanCycle"}
 function C.Snapshot()
@@ -1547,9 +1580,10 @@ local built,buildError=pcall(function()
     Tabs.Collect:AddSlider("DropBatch",{Title="Обычных орбов за проход",Default=3,Min=1,Max=10,Rounding=0,Callback=function(v)M.DropBatch=v end})
     Tabs.Collect:AddSlider("DropInterval",{Title="Пауза между обычными орбами",Default=.6,Min=.25,Max=2,Rounding=2,Callback=function(v)M.DropDelay=v end})
     Tabs.Collect:AddParagraph({Title="Ховерборд",Content="Включи ховерборд вручную. Этот режим направляет его к наземным орбам, не телепортирует. Отключение возвращает обычное управление. Орбы на лестнице тыквы намеренно пропускаются."})
-    toggle(Tabs.Fight,"EventBoss","Auto Boss","Лучшая открытая зона. Входит только при рекомендованных монетах и удаче, затем кликает по целям.",function(v)
+    toggle(Tabs.Fight,"EventBoss","Auto Boss","Лучшая зона: рекомендованные монеты + выбранный процент удачи. Недостижимый порог ограничивается полным банком.",function(v)
         E.AutoBoss=v;E.BossStartNext=0;if not v then E.CancelStart()end
     end)
+    Tabs.Fight:AddSlider("BossLuckPercent",{Title="Удача для босса, % от рекомендации",Default=100,Min=50,Max=200,Rounding=0,Callback=function(v)E.BossLuckPercent=v;E.BossStartNext=0 end})
     toggle(Tabs.Fight,"EventProgress","Auto переход в новую зону","После подтверждённого открытия арены. Ждёт окончания камеры босса.",function(v)E.AutoProgress=v end)
     toggle(Tabs.Fight,"EventBreak","Auto ломание всех","Распределяет твоих экипированных питомцев по объектам зоны фарма. Считает серверные подтверждения урона.",function(v)
         M.AutoBreak=v;M.NextBreak=0;if not v then M.ReleasePets()end
