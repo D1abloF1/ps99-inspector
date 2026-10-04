@@ -9,7 +9,7 @@ local L:any=RS:WaitForChild("Library",15)
 assert(L,"PS99 Library unavailable")
 local loadModule:any=require
 local Http=game:GetService("HttpService")
-local M:any={Alive=true,Version="1.5-tree-refill-test",Started=os.clock(),Connections={},Owned={},Errors={},
+local M:any={Alive=true,Version="1.6-upgrade-trip-test",Started=os.clock(),Connections={},Owned={},Errors={},
     AutoBreak=false,AutoDrops=false,AntiAFK=false,DropBusy=false,DropDelay=.6,DropBatch=3,
     LuckyDelay=.8,OrbWait=6,OrbScope="Лучшая зона",OrbMovement="Телепорт",BreakScope="Все открытые",
     BreakStatus="Выключено",DropStatus="Выключен",AFKStatus="Выключен",Assigned=0,RemovedDrops=0,
@@ -87,7 +87,7 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
             E.ProgressInstance=inst;E.ProgressZone=best;return
         end
         if best<=(E.ProgressZone or best)then return end
-        if E.PumpkinPending or E.HW.Feature("Boss").IsFighting()or E.HW.Feature("Boss").HudHidden or M.Farm or M.AutoRank then return end
+        if E.UpgradePending or E.PumpkinPending or E.HW.Feature("Boss").IsFighting()or E.HW.Feature("Boss").HudHidden or M.Farm or M.AutoRank then return end
         local c=LP.Character;local r=c and c:FindFirstChild("HumanoidRootPart")
         local h=c and c:FindFirstChildOfClass("Humanoid")
         local ground=inst.model:FindFirstChild("ZONE_GROUND")
@@ -198,13 +198,25 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
         end
         return selected
     end
+    function E.RestoreUpgrade()
+        local trip=E.UpgradeReturn;E.UpgradeReturn=nil
+        if not trip then return end
+        pcall(function()
+            if LP.Character==trip.Character and root()==trip.Root and E.HW.Instance()==trip.Instance
+                and not E.HW.Feature("Boss").IsFighting()and not E.HW.Feature("Boss").HudHidden then
+                trip.Root.CFrame=trip.Position;trip.Root.AssemblyLinearVelocity=Vector3.zero
+            end
+        end)
+    end
     function E.CancelUpgrade()
         if E.UpgradeTask then pcall(task.cancel,E.UpgradeTask);E.UpgradeTask=nil end
+        E.RestoreUpgrade()
         E.UpgradePending=false
     end
     function E.UpgradeStep()
         if not E.AutoUpgrades then E.UpgradeStatus="Выключено";return end
         if E.PumpkinPending or E.UpgradePending or os.clock()<E.NextUpgrade then return end
+        if M.EntryPending or M.DropBusy or (M.Clan and M.Clan.Pending)or (M.AutoEgg and M.AutoEgg.Pending)then return end
         E.NextUpgrade=os.clock()+2
         if not E.Init()or not E.HW.Instance()then E.UpgradeStatus="Войди в Hatch Wars";return end
         if not E.EnsurePriorities()then E.UpgradeStatus="Ивентовые апгрейды недоступны в этой локации";return end
@@ -217,18 +229,41 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
             E.UpgradeStatus="Копим на "..dir.Name..": "..cost:CountExact().."/"..cost:GetAmount();return
         end
         local inst=E.HW.Instance()
-        E.UpgradePending=true;E.UpgradeStatus="Покупаем "..dir.Name.." · уровень "..(tier+1)
+        local interact=inst.model and inst.model:FindFirstChild("INTERACT")
+        local machines=interact and interact:FindFirstChild("Machines")
+        local machine=machines and machines:FindFirstChild("HatchWarUpgradeMachine")
+        local pad=machine and (machine:FindFirstChild("Pad")or machine:FindFirstChild("Interact"))
+        local r=root()
+        if not r then E.UpgradeStatus="Ожидание персонажа";return end
+        if not pad or not pad:IsA("BasePart")then E.UpgradeStatus="Ожидание зоны апгрейдов";return end
+        E.UpgradePending=true;E.UpgradeStatus="Идём к апгрейдам: "..dir.Name.." · уровень "..(tier+1)
+        E.UpgradeReturn={Character=LP.Character,Root=r,Instance=inst,Position=r.CFrame}
+        if M.ClearLucky then M.ClearLucky()end
+        if M.ClearHover then M.ClearHover()end
         E.UpgradeTask=task.spawn(function()
-            local ok,result=pcall(function()
+            local ok,result,reason=pcall(function()
                 if not M.Alive or not E.AutoUpgrades or E.HW.Instance()~=inst then return false end
+                r.CFrame=pad.CFrame*CFrame.new(0,pad.Size.Y/2+3,0)
+                r.AssemblyLinearVelocity=Vector3.zero
+                task.wait(.8)
+                if not M.Alive or not E.AutoUpgrades or E.HW.Instance()~=inst or root()~=r then return false end
                 if E.SelectUpgrade()~=dir or E.UpgradeCmds.GetTier(dir)~=tier
                     or not E.HW.Feature("Upgrades").CanAfford(dir)then return false end
-                return E.UpgradeCmds.Purchase(dir)
+                E.UpgradeStatus="Покупаем "..dir.Name.." · уровень "..(tier+1)
+                local accepted,message=E.UpgradeCmds.Purchase(dir)
+                if accepted then
+                    local deadline=os.clock()+3
+                    while M.Alive and E.AutoUpgrades and E.HW.Instance()==inst
+                        and E.UpgradeCmds.GetTier(dir)<=tier and os.clock()<deadline do task.wait(.1)end
+                    if E.UpgradeCmds.GetTier(dir)<=tier then return false,"Ждём подтверждения уровня"end
+                end
+                return accepted,message
             end)
+            E.RestoreUpgrade()
             E.UpgradePending=false;E.UpgradeTask=nil
             E.NextUpgrade=os.clock()+(ok and result and 3 or 15)
             if M.Alive and E.AutoUpgrades then
-                E.UpgradeStatus=ok and result and ("Куплено: "..dir.Name.." · уровень "..(tier+1))or "Покупка отклонена · повтор через 15 с"
+                E.UpgradeStatus=ok and result and ("Куплено: "..dir.Name.." · уровень "..(tier+1).." · вернулись")or ("Покупка не подтверждена · повтор через 15 с · "..tostring(ok and reason or result))
             end
         end)
     end
@@ -441,7 +476,7 @@ return function(M:any, LP:Player, L:any, loadModule:any, Window:any)
         if not E.Init()or not E.HW.Instance()then E.BossStatus="Войди в Hatch Wars";return end
         local boss=E.HW.Feature("Boss")
         if not boss.IsFighting()then
-            if E.PumpkinPending then E.BossStatus="Пауза: гигантская тыква";return end
+            if E.PumpkinPending or E.UpgradePending then E.BossStatus="Пауза: тыква / апгрейды";return end
             if E.WasFighting then E.WasFighting=false;E.BossStartNext=os.clock()+8 end
             if E.BossPending then E.BossStatus="Ожидание старта боя…";return end
             if os.clock()<E.BossStartNext then return end
@@ -541,7 +576,7 @@ local function blocked():boolean
     M.Conflict=nil
     if not E.Init()or not E.HW.Instance()then return true end
     local boss=E.HW.Feature("Boss")
-    return E.BossPending or boss.IsFighting()or boss.HudHidden or E.PumpkinPending
+    return E.BossPending or boss.IsFighting()or boss.HudHidden or E.PumpkinPending or E.UpgradePending
 end
 local function allowedZone(inst:any,pos:Vector3,scope:string):boolean
     local zone=E.ZoneAt(inst,pos)
@@ -1535,7 +1570,7 @@ local built,buildError=pcall(function()
     end)
     M.PumpkinCard=Tabs.Pumpkin:AddParagraph({Title="Гигантская тыква",Content="Выключена"})
     Tabs.Pumpkin:AddParagraph({Title="Как работает",Content="Проверяет актуальный Spare непосредственно перед отдачей, соблюдает игровой cooldown. После открытия награды выдаёт игра; фиктивного Claim здесь нет."})
-    toggle(Tabs.Upgrades,"EventUpgrade","Auto Event Upgrades","Строгий порядок сверху вниз: первый выбранный до максимума, затем следующий.",function(v)
+    toggle(Tabs.Upgrades,"EventUpgrade","Auto Event Upgrades","Первый выбранный до максимума. Хватает палочек → TP к машине, покупка и возврат к прежнему действию.",function(v)
         E.AutoUpgrades=v;E.NextUpgrade=0;if not v then E.CancelUpgrade()end
     end)
     Tabs.Upgrades:AddParagraph({Title="Приоритет",Content="Выбери буст, затем нажми «Выше» или «Ниже». Недостаточно ресурсов для верхнего — копим, не пропускаем. Порядок сохраняется."})
@@ -1634,7 +1669,7 @@ elseif saved then
 else C.Ready=true;C.Status="Автосохранение готово"end
 table.insert(M.Connections,LP.CharacterAdded:Connect(function()
     K.Cancel();if K.Enabled then K.SetPhase("Bank")end
-    M.ClearLucky();M.ReleasePets();M.ClearHover();M.CancelDrops();E.CancelStart();E.CancelPumpkin()
+    M.ClearLucky();M.ReleasePets();M.ClearHover();M.CancelDrops();E.CancelStart();E.CancelPumpkin();E.CancelUpgrade()
     E.NextOrb=os.clock()+3;E.BossStartNext=os.clock()+3;M.NextBreak=os.clock()+3
 end))
 M.Worker=task.spawn(function()
@@ -1646,11 +1681,12 @@ M.Worker=task.spawn(function()
             C.Step();W.Step()
             if M.AutoEnter and not M.EntryPending and os.clock()>=M.EntryNext then M.EnterEvent()end
             if M.Conflict then M.SetDesc(E.Card,M.Conflict)end
+            if not M.Conflict and E.Init()then E.UpgradeStep()end
             if K.Enabled then K.Step()
             elseif not N.Pending then
                 if not blocked()then E.ProgressStep();E.PumpkinStep()end
                 E.OrbStep()
-                if not M.Conflict and E.Init()then E.BossStep();E.UpgradeStep()end
+                if not M.Conflict and E.Init()then E.BossStep()end
             end
             N.Step()
             if not N.Pending then M.BreakStep();M.DropStep()end
