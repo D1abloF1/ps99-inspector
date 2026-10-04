@@ -9,9 +9,10 @@ local L:any=RS:WaitForChild("Library",15)
 assert(L,"PS99 Library unavailable")
 local loadModule:any=require
 local Http=game:GetService("HttpService")
-local M:any={Alive=true,Version="1.8-auto-flame-test",Started=os.clock(),Connections={},Owned={},Errors={},
+local M:any={Alive=true,Version="1.9-config-boost-test",Started=os.clock(),Connections={},Owned={},Errors={},
     AutoBreak=false,AutoDrops=false,AntiAFK=false,DropBusy=false,DropDelay=.6,DropBatch=3,
     LuckyDelay=.8,OrbWait=6,OrbScope="Лучшая зона",OrbMovement="Телепорт",BreakScope="Все открытые",
+    FarmRouteSeconds=20,ClickAura=false,ClickRadius=150,NextTap=0,TapSent=0,TapConfirmed=0,
     BreakStatus="Выключено",DropStatus="Выключен",AFKStatus="Выключен",Assigned=0,RemovedDrops=0,
     RemovedLucky=0,LuckGained=0,AFKAttempts=0,AFKObserved=0,NextBreak=0,NextDrop=0,NextAFK=0}
 env.PS99EventHub=M
@@ -19,10 +20,13 @@ local Pets:any=loadModule(L.Client.PlayerPet)
 local Network:any=loadModule(L.Client.Network)
 local Map:any=loadModule(L.Client.MapCmds)
 local Breakables:any=loadModule(L.Client.BreakableFrontend)
+local TapSignal:any=loadModule(L.Signal)
+local TapEnchants:any=loadModule(L.Client.EnchantCmds)
 M.FarmAreaTP=true;M.FarmHits=0;M.FarmRequests=0;M.NextFarmMove=0
 table.insert(M.Connections,Breakables.DamageDealt:Connect(function(b:any,_health:any,_damage:any,_pet:any,owner:any)
     if M.Alive and M.AutoBreak and owner==LP and b.parentID=="HatchWar"then
         M.FarmHits+=1;M.LastFarmHit=os.clock()
+        if not _pet then M.TapConfirmed+=1 end
     end
 end))
 local function root():BasePart?
@@ -725,6 +729,29 @@ function M.ReleasePets()
     end
     table.clear(M.Owned)
 end
+function M.ResetFarmRoute()
+    M.FarmZone=nil;M.FarmRouteAt=nil;M.FarmRouteInstance=nil;M.FarmRouteScope=nil
+end
+function M.ChooseFarmZone(inst:any,groups:any):number?
+    if M.FarmRouteInstance~=inst or M.FarmRouteScope~=M.BreakScope then
+        M.ResetFarmRoute();M.FarmRouteInstance=inst;M.FarmRouteScope=M.BreakScope
+    end
+    if M.BreakScope=="Лучшая зона"then M.FarmZone=E.BestZone();return M.FarmZone end
+    if M.BreakScope=="Текущая зона"then
+        local r=root();M.FarmZone=r and E.ZoneAt(inst,r.Position);return M.FarmZone
+    end
+    local zones={}
+    for zone,targets in pairs(groups)do if #targets>0 and E.HW.Feature("Hud").Unlocked(zone)then table.insert(zones,zone)end end
+    table.sort(zones,function(a,b)return a>b end)
+    if #zones==0 then return nil end
+    local index=table.find(zones,M.FarmZone)
+    if not index then
+        M.FarmZone=zones[1];M.FarmRouteAt=os.clock();M.ReleasePets()
+    elseif os.clock()-(M.FarmRouteAt or os.clock())>=M.FarmRouteSeconds then
+        M.FarmZone=zones[index%#zones+1];M.FarmRouteAt=os.clock();M.ReleasePets()
+    end
+    return M.FarmZone
+end
 function M.BreakStep()
     if not M.AutoBreak then M.BreakStatus="Выключено";return end
     if os.clock()<M.NextBreak then return end
@@ -733,11 +760,16 @@ function M.BreakStep()
     if M.DropBusy or E.OrbTarget then M.BreakStatus="Пауза движения: подбор орбов";return end
     local inst=E.HW.Instance();local r=root();if not r then return end
     local things=workspace:FindFirstChild("__THINGS")
-    local folder=things and things:FindFirstChild("Breakables");local targets={}
+    local folder=things and things:FindFirstChild("Breakables");local groups={}
     if folder then for _,v in ipairs(folder:GetChildren())do
         if v:IsA("Model")and v:GetAttribute("ParentID")=="HatchWar"and
-            allowedZone(inst,v:GetPivot().Position,M.BreakScope)then table.insert(targets,v)end
+            allowedZone(inst,v:GetPivot().Position,M.BreakScope)then
+            local zone=E.ZoneAt(inst,v:GetPivot().Position)
+            groups[zone]=groups[zone]or {};table.insert(groups[zone],v)
+        end
     end end
+    local zone=M.ChooseFarmZone(inst,groups)
+    local targets=zone and groups[zone]or {}
     table.sort(targets,function(a,b)return (a:GetPivot().Position-r.Position).Magnitude<(b:GetPivot().Position-r.Position).Magnitude end)
     if #targets==0 then M.ReleasePets();M.BreakStatus="Нет брейкаблов в выбранных зонах";return end
     -- Verified: requests from the pumpkin platform do no damage. Enter a real break area.
@@ -757,7 +789,7 @@ function M.BreakStep()
         M.NextFarmMove=os.clock()+3;M.NextBreak=os.clock()+1;E.Teleports+=1
         M.BreakStatus="Входим в зону фарма · ожидание подтверждения";return
     end
-    if M.BreakScope~="Все открытые"then targets=nearby end
+    targets=nearby
     local batch={};local n=0
     for _,pet in pairs(Pets.GetByPlayer(LP))do
         if not pet.destroyed and pet.owner==LP then
@@ -773,9 +805,39 @@ function M.BreakStep()
         end
     end
     if next(batch)then Network.Fire("Breakables_JoinPetBulk",batch);M.FarmRequests+=1 end
-    M.BreakStatus="Своих питомцев: "..n.." · целей: "..#targets.." · подтверждённых ударов: "..M.FarmHits
+    M.BreakStatus="Зона "..tostring(zone).." · питомцев: "..n.." · целей: "..#targets.." · подтверждённых ударов: "..M.FarmHits
+    if M.BreakScope=="Все открытые"then M.BreakStatus..=" · переход каждые "..M.FarmRouteSeconds.." с"end
     if M.FarmRequests>5 and (not M.LastFarmHit or os.clock()-M.LastFarmHit>8)then
         M.BreakStatus..="\nИгра пока не подтверждает урон"
+    end
+end
+function M.TapStep()
+    if not M.ClickAura or not M.AutoBreak or os.clock()<M.NextTap then return end
+    local power=TapEnchants.GetPower("Swift Taps")
+    local rate=type(power)=="number"and power>0 and math.min(8*(1+power/100),16)or 8
+    M.NextTap=os.clock()+1/rate+.01
+    if blocked()or M.DropBusy or E.OrbTarget or (M.AutoEgg and M.AutoEgg.Pending)or M.Clan.Pending then return end
+    if not Map.IsInDottedBox()then return end
+    local inst=E.HW.Instance();local r=root();if not r then return end
+    local config=loadModule(L.Client.InstancingCmds).GetInstanceConfig()or{}
+    local radius=math.min(M.ClickRadius,config.AutoTapMaxDistance or config.MaxClickDistance or 150)
+    local things=workspace:FindFirstChild("__THINGS")
+    local folder=things and things:FindFirstChild("Breakables");local targets={}
+    if folder then for _,v in ipairs(folder:GetChildren())do
+        if v:IsA("Model")and v:GetAttribute("ParentID")=="HatchWar"and not v:GetAttribute("ManualDamage")and not v:GetAttribute("DisableDamage")then
+            local pos=v:GetPivot().Position
+            if (pos-r.Position).Magnitude<=radius and allowedZone(inst,pos,M.BreakScope)then table.insert(targets,v)end
+        end
+    end end
+    if #targets==0 then M.TapStatus="Нет целей в радиусе "..radius;return end
+    table.sort(targets,function(a,b)return tostring(a:GetAttribute("BreakableUID"))<tostring(b:GetAttribute("BreakableUID"))end)
+    M.TapCursor=(M.TapCursor or 0)%#targets+1
+    local uid=targets[M.TapCursor]:GetAttribute("BreakableUID")
+    if uid then
+        -- Verified game handler shares a global debounce; a same-frame burst is discarded.
+        -- Round-robin avoids keeping every click on one still-living target.
+        TapSignal.Fire("Shoot_Breakable",targets[M.TapCursor]);M.TapSent+=1
+        M.TapStatus="Радиус "..radius.." · целей "..#targets.." · запросов "..M.TapSent.." · урон подтверждён "..M.TapConfirmed
     end
 end
 function M.DropStep()
@@ -794,7 +856,9 @@ function M.DropStep()
                 if folder then for _,orb in ipairs(folder:GetChildren())do
                     if (orb:IsA("BasePart")or orb:IsA("Model"))and (M.DropSkipped[orb]or 0)<=os.clock()then
                         local pos=orb:IsA("BasePart")and orb.Position or (orb::Model):GetPivot().Position
-                        if allowedZone(inst,pos,M.OrbScope)then
+                        local allowed=allowedZone(inst,pos,M.OrbScope)
+                        if M.AutoBreak and M.FarmZone then allowed=E.ZoneAt(inst,pos)==M.FarmZone end
+                        if allowed then
                             local distance=(pos-r.Position).Magnitude
                             if distance<nearest then target=orb;nearest=distance end
                         end
@@ -812,6 +876,7 @@ function M.DropStep()
         end)
         if not ok then M.DropStatus="Ошибка: "..tostring(err);M.NextDrop=os.clock()+5 end
         M.DropBusy=false;M.DropTask=nil
+        M.NextDrop=os.clock()+(M.AutoBreak and 3 or 1)
     end)
 end
 M.DropSkipped=setmetatable({},{__mode="k"})
@@ -874,7 +939,7 @@ local UIS=game:GetService("UserInputService")
 -- Clan controller owns movement while enabled. Resource operations use the game's
 -- existing APIs, never an invented stalk remote or a fabricated climb sequence.
 local K:any={Enabled=false,Phase="Bank",Status="Выключен",FillPercent=80,MinMult=2,BatchLimit=3,
-    Batch=0,Hatches=0,Candles=0,Lanterns=0,FarmMinutes=10,
+    Batch=0,Hatches=0,Candles=0,Lanterns=0,FarmMinutes=10,AutoBoost=false,
     Replenish=false,Reroll=false,Epoch=0,Next=0,Pending=false,Log={},
     Multipliers={ ["2"]=true,["2.5"]=true,["3"]=true },
     Boosts={ ["Свеча I"]=true,["Свеча II"]=true,["Фонарь I"]=true,["Фонарь II"]=true }}
@@ -911,6 +976,7 @@ function K.Selection(values:any)
     return selected
 end
 function K.Wants(category:string):boolean
+    if not K.AutoBoost then return false end
     local prefix=category=="Candle"and "Свеча "or "Фонарь "
     return K.Boosts[prefix.."I"]==true or K.Boosts[prefix.."II"]==true
 end
@@ -978,6 +1044,8 @@ function K.Cancel()
     K.Pending=false
 end
 function K.SetEnabled(value:boolean)
+    -- An already-disabled clan controller must not stop unrelated restored routines.
+    if not value and not K.Enabled then return end
     K.Cancel();K.Enabled=value
     E.AutoOrbs=false;E.AutoBoss=false;E.AutoPumpkin=false;E.AutoUpgrades=false;E.AutoProgress=false
     M.AutoBreak=false;M.AutoDrops=false
@@ -1008,16 +1076,24 @@ function K.Async(fn:any,nextDelay:number?)
 end
 function K.Use(category:string,valid:any)
     if not K.Wants(category)then return true end
-    if K.Bursts.BestArmed(LP,category)>0 then return true end
+    if K.Bursts.BestArmed(LP,category)>0 then
+        if K.Unconfirmed==category then K.Unconfirmed=nil end
+        return true
+    end
+    if K.BoostBusy or K.Unconfirmed then return false,"Ждём подтверждения предыдущего бустера"end
     local item=K.Stock(category)
     if not item then return false,"Нет "..category end
-    local accepted,reason=K.Consume.Consume(item,1)
+    K.BoostBusy=true
+    local ok,accepted,reason=pcall(K.Consume.Consume,item,1)
+    K.BoostBusy=false
+    if not ok then K.Unconfirmed=category;return false,"Ответ на использование не получен; повтор не отправляем"end
     if not accepted then return false,tostring(reason)end
+    K.Unconfirmed=category
     if category=="Candle"then K.Candles+=1 else K.Lanterns+=1 end
     local untilTime=os.clock()+3
     repeat
         if not valid()then return false,"Остановлено"end
-        if K.Bursts.BestArmed(LP,category)>0 then return true end
+        if K.Bursts.BestArmed(LP,category)>0 then K.Unconfirmed=nil;return true end
         task.wait(.15)
     until os.clock()>=untilTime
     K.Unconfirmed=category
@@ -1087,8 +1163,8 @@ function K.Step()
     local boss=E.HW.Feature("Boss")
     if boss.IsFighting()or boss.HudHidden or E.BossPending then K.Status="Пауза: бой с боссом";return end
     if blocked()then K.Status=M.Conflict or "Пауза: персонаж / тыква";return end
-    if K.Pending or E.PumpkinPending then return end
-    if K.Unconfirmed then
+    if K.Pending or E.PumpkinPending or (M.AutoBoost and M.AutoBoost.Pending)then return end
+    if K.AutoBoost and K.Unconfirmed then
         if K.Bursts.BestArmed(LP,K.Unconfirmed)>0 then K.Unconfirmed=nil
         else K.Status="Пауза: ждём подтверждения использованного бустера; повтор не отправляем";return end
     end
@@ -1296,6 +1372,27 @@ function F.Step():boolean
 end
 local N:any={Enabled=false,Pending=false,Next=0,Epoch=0,Batches=0,Pets=0,Status="Выключено"}
 M.AutoEgg=N
+local B:any={Pending=false,Next=0,Status="Выключены"}
+M.AutoBoost=B
+function B.Prepare(valid:any)
+    for _,category in ipairs({"Brew","Candle"})do
+        if not valid()then return false,"Остановлено"end
+        local ok,why=K.Use(category,valid)
+        if not ok then return false,why end
+    end
+    return true
+end
+function B.Step()
+    if not K.AutoBoost or B.Pending or K.Pending or N.Pending or K.Enabled or N.Enabled or os.clock()<B.Next then return end
+    B.Next=os.clock()+.5
+    if not K.Init()or blocked()or M.EntryPending or not E.HW.Instance()then return end
+    local inst=E.HW.Instance();B.Pending=true
+    B.Task=task.spawn(function()
+        local ok,active,why=pcall(B.Prepare,function()return M.Alive and K.AutoBoost and not K.Enabled and not N.Enabled and E.HW.Instance()==inst end)
+        B.Status=ok and (active and "Выбранные бустеры готовы · ждём открытия / окончания фонаря"or tostring(why))or "Ошибка автобустера"
+        B.Pending=false;B.Task=nil;B.Next=os.clock()+1
+    end)
+end
 function N.SetEnabled(value:boolean)
     N.Epoch+=1;N.Enabled=value;N.Pending=false;N.Next=0
     if N.Task then pcall(task.cancel,N.Task);N.Task=nil end
@@ -1314,7 +1411,7 @@ function N.Nearest()
     return best
 end
 function N.Step()
-    if not N.Enabled or N.Pending or os.clock()<N.Next then return end
+    if not N.Enabled or N.Pending or B.Pending or os.clock()<N.Next then return end
     if F.Active then N.Status="Пауза: набираем пламя удачи";return end
     if K.Enabled then N.Status="Открытиями управляет цикл КБ";return end
     if not K.Init()or blocked()or M.EntryPending then N.Status="Пауза: вход / бой / тыква";return end
@@ -1330,6 +1427,12 @@ function N.Step()
         local ok=pcall(function()
             local r=root()
             if not r or not N.Enabled or K.Enabled or not egg:IsHatchable()or (r.Position-egg:GetPosition()).Magnitude>35 then return end
+            local function valid()return M.Alive and N.Enabled and epoch==N.Epoch and E.HW.Instance()==inst end
+            if K.AutoBoost then
+                local ready,why=B.Prepare(valid)
+                if not ready then N.Status="Бустер: "..tostring(why);return end
+            end
+            if not valid()or not egg:IsHatchable()or (r.Position-egg:GetPosition()).Magnitude>35 then return end
             local accepted,reason=Network.Invoke("CustomEggs_Hatch",egg._uid,count)
             if epoch~=N.Epoch or not M.Alive or E.HW.Instance()~=inst then return end
             if accepted then N.Batches+=1;N.Pets+=count;N.Status=egg._id.." · открыто "..count.." · всего "..N.Pets
@@ -1379,12 +1482,36 @@ function M.SetDesc(card:any,text:string)
     card:SetDesc(text)
 end
 -- Device-local configuration. Never include the standalone destructive toggle.
-local C:any={Path="PS99_Event/settings-v1.json",AutoLoad=false,AutoSave=true,Ready=false,Next=0}
+local C:any={Path="PS99_Event/settings-v1.json",WebhookPath="PS99_Event/webhook-v1.json",AutoLoad=false,AutoSave=true,Ready=false,Next=0}
 M.Config=C
+C.WebhookIDs={"WebhookUrl","WebhookDiscordID","WebhookTypes","WebhookEnabled"}
+function C.SaveWebhook()
+    if not C.WebhookReady or type(writefile)~="function"then return false end
+    local ok=pcall(function()
+        if type(makefolder)=="function"then makefolder("PS99_Event")end
+        local values={}
+        for _,id in ipairs(C.WebhookIDs)do
+            local option=M.Fluent.Options[id]
+            values[id]=option.Type=="Dropdown"and K.Selection(option.Value)or option.Value
+        end
+        writefile(C.WebhookPath,Http:JSONEncode({Schema=1,Values=values}))
+    end)
+    if ok then C.WebhookDirty=false else C.Status="Не удалось сохранить вебхук на устройстве"end
+    return ok
+end
+function C.ReadWebhook()
+    local ok,data=pcall(function()
+        if type(isfile)~="function"or not isfile(C.WebhookPath)then return nil end
+        local raw=readfile(C.WebhookPath);if #raw>32768 then return nil end
+        return Http:JSONDecode(raw)
+    end)
+    if ok and type(data)=="table"and data.Schema==1 and type(data.Values)=="table"then return data end
+    return nil
+end
 C.IDs={"EventMinimize","ClanFill","ClanMultiplier","ClanBoosts","ClanBatch","ClanFarmMinutes",
-    "EventAutoEgg",
+    "EventAutoEgg","ClanAutoBoost",
     "ClanHideHatch","EventScope","EventMovement","LuckyInterval","PickupTimeout",
-    "DropBatch","DropInterval","EventFarmTP","BreakScope","EventAFK","EventProgress",
+    "DropBatch","DropInterval","EventFarmTP","BreakScope","FarmRouteSeconds","EventClickAura","EventClickRadius","EventAFK","EventProgress",
     "EventUpgrade","EventBoss","BossLuckPercent","AutoFlame","FlameTier","EventBreak","EventDrops","EventLucky","ClanCycle",
     "WebhookEnabled","WebhookUrl","WebhookDiscordID","WebhookTypes","ConfigAutoLoad","ConfigAutoSave"}
 C.Active={"EventBoss","EventBreak","EventDrops","EventLucky","EventAutoEgg","ClanCycle","AutoFlame"}
@@ -1411,7 +1538,10 @@ function C.ApplyPriority()
 end
 function C.Save()
     if type(writefile)~="function"then C.Status="Сохранение файлов не поддерживается";return false end
-    local ok=pcall(function()local encoded=Http:JSONEncode(C.Snapshot());writefile(C.Path,encoded);C.Last=encoded end)
+    local ok=pcall(function()
+        if type(makefolder)=="function"then makefolder("PS99_Event")end
+        local encoded=Http:JSONEncode(C.Snapshot());writefile(C.Path,encoded);C.Last=encoded
+    end)
     C.Status=ok and "Настройки сохранены на этом устройстве"or "Не удалось сохранить настройки"
     return ok
 end
@@ -1426,12 +1556,15 @@ function C.Read()
     return nil
 end
 function C.Apply(data:any)
+    if type(setthreadidentity)=="function"then setthreadidentity(8)end
     if not data then C.Status="Сохранённых настроек нет";return false end
     M.Restoring=true
     C.PendingPriority=type(data.Priority)=="table"and data.Priority or nil
     C.ApplyPriority()
     local active={};for _,id in ipairs(C.Active)do active[id]=true;M.Toggles[id]:SetValue(false)end
     local function set(id:string)
+        -- Webhook preferences are device-global, independent of an older farm preset.
+        if C.WebhookReady and table.find(C.WebhookIDs,id)then return end
         local option=M.Fluent.Options[id];local value=data.Values[id]
         if not option or value==nil then return end
         if option.Type=="Toggle"then if type(value)~="boolean"then return end
@@ -1458,8 +1591,10 @@ function C.Apply(data:any)
     return true
 end
 function C.Step()
-    if not C.Ready or os.clock()<C.Next then return end
+    if os.clock()<C.Next then return end
     C.Next=os.clock()+2
+    if C.WebhookDirty then C.SaveWebhook()end
+    if not C.Ready then return end
     C.ApplyPriority()
     if C.AutoSave then
         local encoded=Http:JSONEncode(C.Snapshot())
@@ -1567,6 +1702,7 @@ table.insert(M.Connections,UIS.InputChanged:Connect(function(input)
     if input.UserInputType==Enum.UserInputType.MouseMovement then M.LastInput=os.clock()end
 end))
 function M.Stop()
+    K.AutoBoost=false
     F.SetEnabled(false)
     N.SetEnabled(false)
     M.SetHideEggs(false)
@@ -1577,8 +1713,10 @@ end
 function M.Shutdown()
     if type(setthreadidentity)=="function"then setthreadidentity(8)end
     if not M.Alive then return end
+    if C.WebhookDirty then C.SaveWebhook()end
     M.Alive=false;M.Stop()
     if M.EntryTask then pcall(task.cancel,M.EntryTask)end
+    if B.Task then pcall(task.cancel,B.Task)end
     if W.Task then pcall(task.cancel,W.Task)end
     for _,connection in ipairs(M.Connections)do connection:Disconnect()end
     table.clear(M.Connections)
@@ -1648,6 +1786,7 @@ local built,buildError=pcall(function()
     M.FlameCard=Tabs.Clan:AddParagraph({Title="Пламя удачи",Content="Выключено"})
     local multiplier=Tabs.Clan:AddDropdown("ClanMultiplier",{Title="Какие x яйца дерева открывать",Values={"1.25","1.5","2","2.5","3"},Default={"2","2.5","3"},Multi=true})
     multiplier:OnChanged(function(v)K.Multipliers=K.Selection(v)end)
+    toggle(Tabs.Clan,"ClanAutoBoost","Автобустеры · включить расход","Работает с КБ, автооткрытием и ручными открытиями. Одна свеча на следующую партию яиц; фонарь обновляется только после окончания. Сначала выбранный II тир, затем I. Выключено — новые бустеры не тратятся.",function(v)K.AutoBoost=v;B.Next=0;B.Status=v and "Проверяем выбранные бустеры"or "Выключены"end)
     local boosts=Tabs.Clan:AddDropdown("ClanBoosts",{Title="Какие бустеры тратить · несколько галочек",Values={"Свеча I","Свеча II","Фонарь I","Фонарь II"},Default={"Свеча I","Свеча II","Фонарь I","Фонарь II"},Multi=true})
     boosts:OnChanged(function(v)K.Boosts=K.Selection(v)end)
     toggle(Tabs.Clan,"ClanHideHatch","Скрыть анимацию открытия","Пропускает только показ открытия. Без удаления яиц и постоянного сканирования объектов.",function(v)
@@ -1687,11 +1826,14 @@ local built,buildError=pcall(function()
     Tabs.Fight:AddSlider("BossLuckPercent",{Title="Удача для босса, % от рекомендации",Default=100,Min=50,Max=200,Rounding=0,Callback=function(v)E.BossLuckPercent=v;E.BossStartNext=0 end})
     toggle(Tabs.Fight,"EventProgress","Auto переход в новую зону","После подтверждённого открытия арены. Ждёт окончания камеры босса.",function(v)E.AutoProgress=v end)
     toggle(Tabs.Fight,"EventBreak","Auto ломание всех","Распределяет твоих экипированных питомцев по объектам зоны фарма. Считает серверные подтверждения урона.",function(v)
-        M.AutoBreak=v;M.NextBreak=0;if not v then M.ReleasePets()end
+        M.AutoBreak=v;M.NextBreak=0;M.ResetFarmRoute();if not v then M.ReleasePets()end
     end)
     toggle(Tabs.Fight,"EventFarmTP","TP в зону фарма","Сам входит в пунктирную область. Без этого с площадки тыквы / издалека игра не принимает удары.",function(v)M.FarmAreaTP=v end,true)
     local breakScope=Tabs.Fight:AddDropdown("BreakScope",{Title="Брейкаблы: какие зоны",Values={"Все открытые","Лучшая зона","Текущая зона"},Default=1,Multi=false})
-    breakScope:OnChanged(function(v)M.BreakScope=v;M.ReleasePets();M.NextBreak=0 end)
+    breakScope:OnChanged(function(v)M.BreakScope=v;M.ResetFarmRoute();M.ReleasePets();M.NextBreak=0 end)
+    Tabs.Fight:AddSlider("FarmRouteSeconds",{Title="Все открытые: секунд в каждой зоне",Default=20,Min=5,Max=60,Rounding=0,Callback=function(v)M.FarmRouteSeconds=v end})
+    toggle(Tabs.Fight,"EventClickAura","Клик-аура по всем целям","Отдельный быстрый цикл распределяет клики между объектами. Соблюдает выбранные зоны, радиус и игровой таймер кликов; показывает подтверждённый урон, а не только запросы.",function(v)M.ClickAura=v;M.NextTap=0 end)
+    Tabs.Fight:AddSlider("EventClickRadius",{Title="Радиус кликов, studs",Default=150,Min=20,Max=220,Rounding=0,Callback=function(v)M.ClickRadius=v end})
     M.FightCard=Tabs.Fight:AddParagraph({Title="Фарм",Content="Выключено"})
     local pumpkinToggle:any
     local pumpkinApproved=false
@@ -1733,16 +1875,16 @@ local built,buildError=pcall(function()
     Tabs.Settings:AddButton({Title="Сохранить текущие настройки",Callback=function()C.Save();C.Ready=true end})
     Tabs.Settings:AddButton({Title="Загрузить сохранённые настройки",Callback=function()C.Apply(C.Read())end})
     M.ConfigCard=Tabs.Settings:AddParagraph({Title="Сохранение на устройстве",Content="Файл общий для всех аккаунтов в этом executor."})
-    toggle(Tabs.Webhook,"WebhookEnabled","Уведомления Discord","Только подтверждённые редкие хэтчи этого аккаунта.",function(v)W.Enabled=v;W.Status=v and "Ожидаем редкий хэтч"or "Выключен";if not v then table.clear(W.Queue)end end)
-    local hook=Tabs.Webhook:AddInput("WebhookUrl",{Title="Ссылка на Discord webhook",Default="",Placeholder="https://discord.com/api/webhooks/…",Finished=true})
-    hook:OnChanged(function(v)W.Url=string.gsub(tostring(v),"%s","");if W.Url~=""and not W.ValidUrl(W.Url)then W.Status="Проверь ссылку Discord webhook"end end)
-    local discord=Tabs.Webhook:AddInput("WebhookDiscordID",{Title="Твой Discord ID · необязательно",Default="",Placeholder="Числовой ID для упоминания",Finished=true})
-    discord:OnChanged(function(v)W.DiscordID=string.gsub(tostring(v),"%s","")end)
+    toggle(Tabs.Webhook,"WebhookEnabled","Уведомления Discord","Только подтверждённые редкие хэтчи этого аккаунта.",function(v)W.Enabled=v;W.Status=v and "Ожидаем редкий хэтч"or "Выключен";if not v then table.clear(W.Queue)end;if C.WebhookReady then C.WebhookDirty=true end end)
+    local hook=Tabs.Webhook:AddInput("WebhookUrl",{Title="Ссылка на Discord webhook",Default="",Placeholder="https://discord.com/api/webhooks/…",Finished=false})
+    hook:OnChanged(function(v)W.Url=string.gsub(tostring(v),"%s","");if W.Url~=""and not W.ValidUrl(W.Url)then W.Status="Проверь ссылку Discord webhook"end;if C.WebhookReady then C.WebhookDirty=true end end)
+    local discord=Tabs.Webhook:AddInput("WebhookDiscordID",{Title="Твой Discord ID · необязательно",Default="",Placeholder="Числовой ID для упоминания",Finished=false})
+    discord:OnChanged(function(v)W.DiscordID=string.gsub(tostring(v),"%s","");if C.WebhookReady then C.WebhookDirty=true end end)
     local rare=Tabs.Webhook:AddDropdown("WebhookTypes",{Title="Какие выпадения отправлять",Values={"Huge","Titanic","Gargantuan"},Default={"Huge","Titanic","Gargantuan"},Multi=true})
-    rare:OnChanged(function(v)W.Types=K.Selection(v)end)
+    rare:OnChanged(function(v)W.Types=K.Selection(v);if C.WebhookReady then C.WebhookDirty=true end end)
     Tabs.Webhook:AddButton({Title="Выбрать все",Callback=function()rare:SetValue({Huge=true,Titanic=true,Gargantuan=true})end})
     M.WebhookCard=Tabs.Webhook:AddParagraph({Title="Статус уведомлений",Content="Выключен"})
-    Tabs.Webhook:AddParagraph({Title="Важно",Content="Адрес вебхука — секрет. Сохраняется в локальном файле вместе с настройками; не передавай этот файл. В логи адрес не выводится. Discord ID не нужен для обычной отправки."})
+    Tabs.Webhook:AddParagraph({Title="Важно",Content="Вебхук автоматически сохраняется отдельным локальным файлом и восстанавливается на этом устройстве независимо от загрузки настроек фарма. Адрес — секрет: не передавай файл. В логи адрес не выводится."})
     M.MinimizeBind=Tabs.Settings:AddKeybind("EventMinimize",{Title="Клавиша сворачивания",Description="Нажми на клавишу справа, затем на новую кнопку клавиатуры.",Mode="Toggle",Default="LeftControl"})
     Fluent.MinimizeKeybind=M.MinimizeBind
     M.MinimizeBind:OnChanged(function()
@@ -1795,6 +1937,20 @@ local built,buildError=pcall(function()
 end)
 if not built then M.Shutdown();error("Event UI: "..tostring(buildError))end
 local saved=C.Read()
+local savedWebhook=C.ReadWebhook()or saved
+if savedWebhook then
+    for _,id in ipairs(C.WebhookIDs)do
+        local value=savedWebhook.Values[id];local option=Fluent.Options[id]
+        if value~=nil then
+            local valid=(id=="WebhookEnabled"and type(value)=="boolean")
+                or(id=="WebhookTypes"and type(value)=="table")
+                or((id=="WebhookUrl"or id=="WebhookDiscordID")and type(value)=="string"and #value<=512)
+            if valid then pcall(function()option:SetValue(value)end)end
+        end
+    end
+end
+C.WebhookReady=true
+if savedWebhook then C.SaveWebhook()end
 if saved and saved.Values.ConfigAutoLoad==true then C.Apply(saved)
 elseif saved then
     M.Window:Dialog({Title="Загрузить сохранённые настройки?",Content="Настройки общие для всех аккаунтов устройства. Загрузка восстановит сохранённую автоматику. Отдельная автотыква останется выключенной.",Buttons={
@@ -1808,6 +1964,16 @@ table.insert(M.Connections,LP.CharacterAdded:Connect(function()
     M.ClearLucky();M.ReleasePets();M.ClearHover();M.CancelDrops();E.CancelStart();E.CancelPumpkin();E.CancelUpgrade()
     E.NextOrb=os.clock()+3;E.BossStartNext=os.clock()+3;M.NextBreak=os.clock()+3
 end))
+M.TapWorker=task.spawn(function()
+    if type(setthreadidentity)=="function"then setthreadidentity(8)end
+    while M.Alive and not Fluent.Unloaded do
+        if M.ClickAura and E.Ready then
+            local ok,err=pcall(M.TapStep)
+            if not ok then M.TapStatus="Ошибка: "..tostring(err);M.NextTap=os.clock()+2 end
+        end
+        task.wait(.03)
+    end
+end)
 M.Worker=task.spawn(function()
     if type(setthreadidentity)=="function"then setthreadidentity(8)end
     while M.Alive and not Fluent.Unloaded do
@@ -1827,7 +1993,7 @@ M.Worker=task.spawn(function()
                 E.OrbStep()
                 if not M.Conflict and E.Init()then E.BossStep()end
             end
-            N.Step()
+            B.Step();N.Step()
             if not N.Pending then M.BreakStep();M.DropStep()end
             if M.AntiAFK and os.clock()>=M.NextAFK then M.AFKPulse()end
             if os.clock()>=(M.NextUI or 0)then
@@ -1836,12 +2002,12 @@ M.Worker=task.spawn(function()
                 if good then M.SetDesc(E.Card,M.Conflict or status)end
                 M.SetDesc(M.StatsCard,string.format("В игре: %s · сессия: %d мин\nTP: %d · прирост банка удачи: %s\nИсчезнувшие цели: удача %d / обычные %d\nОбычные орбы: %s",
                     LP.Name,math.floor((os.clock()-M.Started)/60),E.Teleports,tostring(M.LuckGained),M.RemovedLucky,M.RemovedDrops,M.DropStatus))
-                M.SetDesc(M.FightCard,M.BreakStatus)
+                M.SetDesc(M.FightCard,M.BreakStatus..(M.ClickAura and ("\nКлик-аура: "..(M.TapStatus or "Ожидание"))or ""))
                 M.SetDesc(M.PumpkinCard,E.PumpkinStatus.."\nОтдано питомцев: "..E.PumpkinFed.." · открыто тыкв: "..E.PumpkinOpened)
                 M.SetDesc(M.AFKCard,M.AFKStatus.."\nИмпульсов: "..M.AFKAttempts.." · ввод подтверждён: "..M.AFKObserved)
                 M.SetDesc(M.ConfigCard,C.Status or "Настройки не сохранены")
                 M.SetDesc(M.WebhookCard,W.Status)
-                M.SetDesc(M.EggCard,N.Status)
+                M.SetDesc(M.EggCard,N.Status.."\nАвтобустеры: "..B.Status)
                 M.SetDesc(M.FlameCard,F.Status)
                 M.SetDesc(M.ClanCard,K.Status.."\n"..(K.EggStatus or "").."\n"..(K.InventoryStatus or "").."\nПринято открытий: "..K.Hatches.." · свечей: "..K.Candles.." · фонарей: "..K.Lanterns.."\nУдача: все открытые зоны, без дерева")
             end
